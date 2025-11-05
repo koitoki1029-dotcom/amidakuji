@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Amidakuji — Static (admin-hidden via secret)</title>
+<style>
+  :root{--bg:#0f172a;--card:#0b1220;--muted:#9aa4b2;--accent:#60a5fa}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;min-height:100vh;background:linear-gradient(180deg,#071029 0%, #07101a 60%);color:#e6eef8;margin:0;display:flex;align-items:center;justify-content:center;padding:24px}
+  .card{background:var(--card);border-radius:12px;padding:18px;max-width:980px;width:100%;box-shadow:0 6px 30px rgba(2,6,23,.6)}
+  header{display:flex;gap:12px;align-items:center;justify-content:space-between}
+  h1{font-size:18px;margin:0}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  input,select,button{padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);background:transparent;color:inherit}
+  canvas{background:#fff;border-radius:8px;display:block;margin-top:14px;width:100%;height:420px}
+  .muted{color:var(--muted);font-size:13px}
+  .admin-only{display:none}
+  .notice{margin-top:8px;color:#ffd580;font-size:13px}
+</style>
+</head>
+<body>
+<div class="card">
+  <header>
+    <div>
+      <h1>あみだくじ (静的・クライアント実行)</h1>
+      <div class="muted">サーバー不要 — GitHub Pages / Netlify / Cloudflare Pages に配置できます</div>
+    </div>
+    <div class="muted">Local-first · Admin secret mode</div>
+  </header>
+
+  <div class="controls">
+    <label class="muted">参加者数: <input id="count" type="number" min="2" value="6" style="width:80px" /></label>
+    <label class="muted">行数 (縦の分割数): <input id="rows" type="number" min="10" value="18" style="width:80px" /></label>
+    <label class="muted">種別: <select id="mode"><option value="random">ランダム生成</option><option value="manual">管理者マッピング(秘密)</option></select></label>
+    <label class="muted admin-only">管理者パスフレーズ: <input id="secret" type="password" placeholder="admin secret" style="width:150px" /></label>
+    <button id="generate">生成 / 更新</button>
+    <button id="reveal">結果を表示 (管理者のみ)</button>
+    <button id="shuffle">結果をシャッフル</button>
+  </div>
+
+  <div class="notice">注意: 完全に秘密にするにはサーバー側での管理（例: Cloudflare Workers）がおすすめです。クライアントだけだと参加者がブラウザを解析すると暴ける可能性があります。</div>
+
+  <canvas id="canvas"></canvas>
+</div>
+
+<script>
+// --- utilities: deterministic RNG from passphrase using Web Crypto (SHA-256 chaining) ---
+async function sha256Hex(input) {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+async function makePRNG(seedStr){
+  // seedStr -> seedHex
+  const seedHex = await sha256Hex(seedStr);
+  let counter = 0;
+  return async function(){
+    const toHash = seedHex + ':' + (counter++);
+    const h = await sha256Hex(toHash);
+    // map first 8 hex digits to number in [0,1)
+    const v = parseInt(h.slice(0,8),16) / 0x100000000;
+    return v;
+  }
+}
+
+function deterministicShuffle(arr, randFloatSync){
+  // randFloatSync must be synchronous; we wrap async calls before use
+  for(let i = arr.length-1;i>0;i--){
+    const j = Math.floor(randFloatSync() * (i+1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+// --- Amidakuji generation & drawing ---
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+function resizeCanvas(){
+  canvas.width = canvas.clientWidth * devicePixelRatio;
+  canvas.height = canvas.clientHeight * devicePixelRatio;
+}
+window.addEventListener('resize',()=>{resizeCanvas(); drawCurrent();});
+resizeCanvas();
+
+let current = {count:6,rows:18,mode:'random',seed:'',layout:[],mapping:[]};
+
+async function generateLayout(){
+  const n = current.count; const rows = current.rows;
+  let randFloat;
+  if(current.mode==='manual'){
+    // mapping created by admin: seed -> mapping; generate layout deterministically from seed
+    const prng = await makePRNG(current.seed || 'default-secret');
+    // synchronous wrapper using cached random values (small but enough)
+    const pool = [];
+    for(let i=0;i<10000;i++){ pool.push(await prng()); }
+    let idx = 0;
+    randFloat = ()=>pool[idx++ % pool.length];
+  } else {
+    // random using crypto.getRandomValues
+    randFloat = ()=>crypto.getRandomValues(new Uint32Array(1))[0]/0xFFFFFFFF;
+  }
+  // create horizontal rungs grid: rows x (n-1) boolean
+  const grid = Array.from({length:rows},()=>Array(n-1).fill(false));
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<n-1;c++){
+      // avoid adjacent rungs: check left
+      if(c>0 && grid[r][c-1]) continue;
+      if(randFloat() < 0.18) grid[r][c] = true; // density
+    }
+  }
+  // if manual mode: use seed to create mapping directly instead: shuffle end labels
+  let mapping = null;
+  if(current.mode==='manual'){
+    const labels = Array.from({length:n},(_,i)=>i);
+    // make deterministic shuffle by using same PRNG pool
+    deterministicShuffle(labels, ()=>{ // synchronous rand using pool from above
+      // rotate through pool values using closure
+      // we captured randFloat which consumes pool sequentially
+      return randFloat();
+    });
+    mapping = labels; // start index -> end index
+  } else {
+    // compute mapping by following paths
+    mapping = [];
+    for(let start=0;start<n;start++){
+      let pos = start;
+      for(let r=0;r<rows;r++){
+        if(pos>0 && grid[r][pos-1]){ pos = pos-1; }
+        else if(pos < n-1 && grid[r][pos]){ pos = pos+1; }
+      }
+      mapping.push(pos);
+    }
+  }
+  current.layout = grid; current.mapping = mapping;
+}
+
+function drawCurrent(reveal=false){
+  resizeCanvas();
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  const padding = 40*devicePixelRatio;
+  const areaW = w - padding*2; const areaH = h - padding*2;
+  const n = current.count; const rows = current.rows;
+  const colX = i => padding + (i/(n-1))*areaW;
+  // draw vertical lines
+  ctx.lineWidth = 2*devicePixelRatio; ctx.strokeStyle = '#cfe9ff';
+  for(let i=0;i<n;i++){
+    const x = Math.round(colX(i));
+    ctx.beginPath(); ctx.moveTo(x,padding); ctx.lineTo(x,padding+areaH); ctx.stroke();
+  }
+  // draw horizontal rungs
+  ctx.lineWidth = 6*devicePixelRatio; ctx.lineCap='round';
+  for(let r=0;r<rows;r++){
+    const y = padding + (r/(rows-1))*areaH;
+    for(let c=0;c<n-1;c++){
+      if(current.layout[r] && current.layout[r][c]){
+        const x1 = colX(c); const x2 = colX(c+1);
+        ctx.beginPath(); ctx.moveTo(x1,y); ctx.lineTo(x2,y);
+        ctx.stroke();
+      }
+    }
+  }
+  // draw labels at top
+  ctx.fillStyle='#e6eef8'; ctx.font = `${14*devicePixelRatio}px sans-serif`; ctx.textAlign='center';
+  for(let i=0;i<n;i++){ ctx.fillText('P'+(i+1), colX(i), padding-10*devicePixelRatio); }
+  // draw results at bottom either hidden or shown
+  ctx.textAlign='center';
+  for(let i=0;i<n;i++){
+    const x = colX(i); const y = padding+areaH+20*devicePixelRatio;
+    if(reveal){ ctx.fillText('R'+(current.mapping[i]+1), x, y); }
+    else { ctx.fillText('?', x, y); }
+  }
+}
+
+async function regenerate(){
+  const count = Math.max(2,parseInt(document.getElementById('count').value || 6));
+  const rows = Math.max(6,parseInt(document.getElementById('rows').value || 18));
+  const mode = document.getElementById('mode').value;
+  current.count = count; current.rows = rows; current.mode = mode;
+  current.seed = document.getElementById('secret').value || '';
+  await generateLayout();
+  drawCurrent(false);
+}
+
+// UI wiring
+document.getElementById('generate').addEventListener('click', async ()=>{ await regenerate(); });
+document.getElementById('reveal').addEventListener('click', ()=>{
+  // ask for secret if manual
+  if(current.mode==='manual'){
+    const entered = prompt('管理者パスフレーズを入力してください(ページに表示しません):');
+    if(!entered) return alert('パスフレーズが必要です');
+    // check by deriving mapping and comparing with current.seed; here we simply set seed then regenerate
+    current.seed = entered; document.getElementById('secret').value = entered;
+    regenerate().then(()=>{ drawCurrent(true); });
+  } else { drawCurrent(true); }
+});
+
+// shuffle results (admin) — only changes mapping, not layout
+document.getElementById('shuffle').addEventListener('click', async ()=>{
+  if(current.mode==='manual'){
+    // change seed slightly to get different mapping
+    current.seed = (current.seed||'') + '#'; document.getElementById('secret').value = current.seed;
+    await regenerate(); drawCurrent(false);
+  } else {
+    // generate new random layout
+    await regenerate(); drawCurrent(false);
+  }
+});
+
+// show/hide admin input based on mode
+document.getElementById('mode').addEventListener('change', (e)=>{
+  const adminInputs = document.querySelectorAll('.admin-only');
+  if(e.target.value==='manual') adminInputs.forEach(el=>el.style.display='inline-block'); else adminInputs.forEach(el=>el.style.display='none');
+});
+
+// initial
+regenerate();
+</script>
+</body>
+</html>
